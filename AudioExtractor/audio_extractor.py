@@ -11,9 +11,12 @@ import tempfile
 import threading
 import time
 import posixpath
+import re
 import tkinter as tk
+import wave
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -51,6 +54,20 @@ def fnv_hash(text: str, variant: str = "fnv1", bits: int = 32, lowercase: bool =
             value = value * prime & mask
             value ^= byte
     return value
+
+
+@lru_cache(maxsize=500_000)
+def natural_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    """Compare digit runs numerically so name_2 sorts before name_11."""
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part.casefold())
+        for part in re.split(r"(\d+)", str(value))
+    )
+
+
+def natural_sort_compare(left: str, right: str) -> int:
+    left_key, right_key = natural_sort_key(left), natural_sort_key(right)
+    return (left_key > right_key) - (left_key < right_key)
 
 
 def decipher(data: bytes | bytearray, seed: int, offset_to_file_start: int = 0) -> bytes:
@@ -237,6 +254,8 @@ class AudioExtractorApp:
         self.root.minsize(680, 480)
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.running = False
+        self._closing = False
+        self._poll_after_id: str | None = None
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(Path.cwd() / "Audio output"))
@@ -246,7 +265,7 @@ class AudioExtractorApp:
         self.mp3_var = tk.BooleanVar(value=False)
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(100, self._poll_events)
+        self._poll_after_id = self.root.after(100, self._poll_events)
 
     @staticmethod
     def _find_tool(*names: str) -> str:
@@ -442,6 +461,9 @@ class AudioExtractorApp:
         self._run_command([self.ffmpeg_var.get(), "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav), "-q:a", "2", str(mp3)])
 
     def _poll_events(self) -> None:
+        self._poll_after_id = None
+        if self._closing:
+            return
         try:
             while True:
                 kind, message = self.events.get_nowait()
@@ -454,7 +476,24 @@ class AudioExtractorApp:
                     self.running = False
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_events)
+        if not self._closing:
+            try:
+                self._poll_after_id = self.root.after(100, self._poll_events)
+            except tk.TclError:
+                self._poll_after_id = None
+
+    def _on_close(self) -> None:
+        self._closing = True
+        if self._poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._poll_after_id)
+            except tk.TclError:
+                pass
+            self._poll_after_id = None
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 def signed_u32(value: int) -> int:
@@ -604,7 +643,8 @@ def build_audio_map(source_root: Path, tables_dir: Path, map_path: Path,
     return total, len(pcks), errors
 
 
-def row_mp3_path(output_root: Path, language: str, asset_path: str, file_id: int) -> Path:
+def row_mp3_path(output_root: Path, language: str, asset_path: str, file_id: int,
+                 add_language_prefix: bool = True) -> Path:
     relative = Path(*safe_audio_path(asset_path).split("/"))
     if relative.is_absolute() or ".." in relative.parts:
         relative = Path(f"Unmapped/{file_id:08X}.wem")
@@ -613,6 +653,15 @@ def row_mp3_path(output_root: Path, language: str, asset_path: str, file_id: int
     else:
         relative = relative.with_name(relative.name + ".mp3")
     lang = safe_audio_path(language) or "Other"
+    language_prefixes = {
+        "english": "EN_",
+        "chinese": "CN_",
+        "japanese": "JP_",
+        "korean": "KR_",
+    }
+    prefix = language_prefixes.get(lang.casefold(), "") if add_language_prefix else ""
+    if prefix and not relative.name.casefold().startswith(prefix.casefold()):
+        relative = relative.with_name(prefix + relative.name)
     if relative.parts and relative.parts[0].lower() == "voice":
         return output_root / relative
     return output_root / lang / relative
@@ -653,7 +702,7 @@ def export_mp3(source_path: Path, offset: int, size: int, file_id: int, destinat
 
 
 def decode_preview(source_path: Path, offset: int, size: int, file_id: int,
-                   vgmstream: str, temp_dir: Path) -> Path:
+                   vgmstream: str, temp_dir: Path) -> tuple[Path, float]:
     """Decrypt and decode one selected WEM to a temporary WAV for preview."""
     with source_path.open("rb") as package:
         package.seek(offset)
@@ -669,7 +718,12 @@ def decode_preview(source_path: Path, offset: int, size: int, file_id: int,
                              capture_output=True, text=True, errors="replace")
     if decoded.returncode or not wav_path.is_file() or wav_path.stat().st_size < 44:
         raise RuntimeError((decoded.stderr or decoded.stdout or "vgmstream failed").strip()[-1200:])
-    return wav_path
+    with wave.open(str(wav_path), "rb") as wav:
+        sample_rate = wav.getframerate()
+        if sample_rate <= 0:
+            raise RuntimeError("vgmstream produced a WAV with an invalid sample rate")
+        duration = wav.getnframes() / sample_rate
+    return wav_path, duration
 
 
 class AudioCatalogApp:
@@ -680,11 +734,16 @@ class AudioCatalogApp:
         root.minsize(900, 560)
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.running = False
+        self._closing = False
+        self._poll_after_id: str | None = None
+        self._refresh_after_id: str | None = None
         self.page_size = 1000
         self.page = 0
         self.match_count = 0
         self.preview_dir: Path | None = None
         self.preview_token = 0
+        self.preview_started_at: float | None = None
+        self.preview_duration = 0.0
         base = Path(__file__).resolve().parents[1]
         self.source_var = tk.StringVar(value=str(base / "Audio raw"))
         self.tables_var = tk.StringVar(value=str(base / "input" / "TableCfgOutput"))
@@ -695,15 +754,15 @@ class AudioCatalogApp:
         self.language_var = tk.StringVar(value="All")
         self.visible_rows: dict[str, tuple] = {}
         self._build_ui()
-        self.root.after(100, self._poll_events)
-        self.root.after(500, self.refresh_catalog)
+        self._poll_after_id = self.root.after(100, self._poll_events)
+        self._refresh_after_id = self.root.after(500, self._run_scheduled_refresh)
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=10)
         frame.pack(fill="both", expand=True)
         for col in (1,):
             frame.columnconfigure(col, weight=1)
-        frame.rowconfigure(7, weight=1)
+        frame.rowconfigure(8, weight=1)
         fields = [("PCK source", self.source_var), ("Game tables", self.tables_var),
                   ("MP3 output", self.output_var), ("vgmstream", self.vgm_var), ("FFmpeg", self.ffmpeg_var)]
         for i, (label, var) in enumerate(fields):
@@ -734,11 +793,20 @@ class AudioCatalogApp:
         yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        self.tree.grid(row=7, column=0, columnspan=5, sticky="nsew")
-        yscroll.grid(row=7, column=5, sticky="ns")
-        xscroll.grid(row=8, column=0, columnspan=5, sticky="ew")
+        self.hide_unmapped_var = tk.BooleanVar(value=True)
+        self.language_prefix_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Hide unmapped Wwise IDs", variable=self.hide_unmapped_var,
+                        command=self._reset_and_refresh).grid(row=7, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(frame, text="Add language prefixes to exports", variable=self.language_prefix_var
+                        ).grid(row=7, column=4, sticky="w", padx=6, pady=(4, 0))
+        self.preview_time_var = tk.StringVar(value="Preview: —")
+        ttk.Label(frame, textvariable=self.preview_time_var).grid(
+            row=7, column=1, columnspan=3, sticky="w", padx=7, pady=(4, 0))
+        self.tree.grid(row=8, column=0, columnspan=5, sticky="nsew")
+        yscroll.grid(row=8, column=5, sticky="ns")
+        xscroll.grid(row=9, column=0, columnspan=5, sticky="ew")
         nav = ttk.Frame(frame)
-        nav.grid(row=8, column=5, sticky="e", padx=(5, 0))
+        nav.grid(row=9, column=5, sticky="e", padx=(5, 0))
         self.prev_button = ttk.Button(nav, text="◀ Previous", command=self._previous_page)
         self.prev_button.pack(side="left")
         self.page_label = ttk.Label(nav, text="Page 0 / 0", width=14, anchor="center")
@@ -746,15 +814,36 @@ class AudioCatalogApp:
         self.next_button = ttk.Button(nav, text="Next ▶", command=self._next_page)
         self.next_button.pack(side="left")
         self.status = tk.StringVar(value="Build the map to index WEM names from your PCKs.")
-        ttk.Label(frame, textvariable=self.status).grid(row=9, column=0, columnspan=6, sticky="w", pady=(5, 2))
+        ttk.Label(frame, textvariable=self.status).grid(row=10, column=0, columnspan=6, sticky="w", pady=(5, 2))
         self.log = tk.Text(frame, height=5, wrap="word", state="disabled")
-        self.log.grid(row=10, column=0, columnspan=6, sticky="ew")
+        self.log.grid(row=11, column=0, columnspan=6, sticky="ew")
         self.search_var.trace_add("write", lambda *_: self._reset_and_refresh())
         self.lang_box.bind("<<ComboboxSelected>>", lambda _e: self._reset_and_refresh())
 
     def _reset_and_refresh(self) -> None:
+        if self._closing:
+            return
         self.page = 0
-        self.root.after(200, self.refresh_catalog)
+        self._cancel_after("_refresh_after_id")
+        try:
+            self._refresh_after_id = self.root.after(200, self._run_scheduled_refresh)
+        except tk.TclError:
+            self._refresh_after_id = None
+
+    def _run_scheduled_refresh(self) -> None:
+        self._refresh_after_id = None
+        if not self._closing:
+            self.refresh_catalog()
+
+    def _cancel_after(self, attribute: str) -> None:
+        callback_id = getattr(self, attribute, None)
+        if callback_id is None:
+            return
+        try:
+            self.root.after_cancel(callback_id)
+        except tk.TclError:
+            pass
+        setattr(self, attribute, None)
 
     def _previous_page(self) -> None:
         if self.page > 0:
@@ -784,6 +873,8 @@ class AudioCatalogApp:
                 clauses, args = [], []
                 if language != "All":
                     clauses.append("language=?"); args.append(language)
+                if self.hide_unmapped_var.get():
+                    clauses.append("asset_path NOT LIKE 'Unmapped/%'")
                 if needle:
                     clauses.append("(display_name LIKE ? OR asset_path LIKE ? OR speaker LIKE ? OR file_id LIKE ? OR file_id=?)")
                     pattern = f"%{needle}%"
@@ -798,7 +889,8 @@ class AudioCatalogApp:
                 pages = (count + self.page_size - 1) // self.page_size
                 if pages and self.page >= pages:
                     self.page = pages - 1
-                rows = db.execute("SELECT id,language,display_name,asset_path,speaker,duration,size,file_id,source_path,offset,relative_pck FROM tracks" + where + " ORDER BY language,asset_path LIMIT ? OFFSET ?", [*args, self.page_size, self.page * self.page_size]).fetchall()
+                db.create_collation("NATURAL_SORT", natural_sort_compare)
+                rows = db.execute("SELECT id,language,display_name,asset_path,speaker,duration,size,file_id,source_path,offset,relative_pck FROM tracks" + where + " ORDER BY language,display_name COLLATE NATURAL_SORT,asset_path COLLATE NATURAL_SORT,file_id LIMIT ? OFFSET ?", [*args, self.page_size, self.page * self.page_size]).fetchall()
             self.match_count = count
             self.page_label.configure(text=f"Page {self.page + 1 if count else 0} / {pages}")
             self.prev_button.configure(state="normal" if self.page > 0 else "disabled")
@@ -811,7 +903,7 @@ class AudioCatalogApp:
                 key, lang, name, asset, speaker, duration, size, file_id, *_ = row
                 numeric_id = int(file_id)
                 uid = str(key); self.visible_rows[uid] = row
-                destination = row_mp3_path(output, lang, asset, numeric_id)
+                destination = row_mp3_path(output, lang, asset, numeric_id, self.language_prefix_var.get())
                 status = "Ready" if destination.is_file() else "—"
                 if not asset.startswith("Unmapped/"):
                     name = Path(asset).with_suffix(".wav").name
@@ -878,8 +970,9 @@ class AudioCatalogApp:
     def _preview_worker(self, row: tuple, temp_dir: Path, token: int) -> None:
         try:
             _key, _language, name, _asset, _speaker, _duration, size, file_id, source_path, offset, _relative = row
-            wav_path = decode_preview(Path(source_path), offset, size, int(file_id), self.vgm_var.get(), temp_dir)
-            self.events.put(("preview_ready", f"{token}\t{wav_path}"))
+            wav_path, duration = decode_preview(
+                Path(source_path), offset, size, int(file_id), self.vgm_var.get(), temp_dir)
+            self.events.put(("preview_ready", f"{token}\t{wav_path}\t{duration:.6f}"))
             self.events.put(("preview_dir", f"{token}\t{temp_dir}"))
             self.events.put(("done", f"Previewing {name}"))
         except Exception as exc:
@@ -896,10 +989,19 @@ class AudioCatalogApp:
         if self.preview_dir:
             shutil.rmtree(self.preview_dir, ignore_errors=True)
             self.preview_dir = None
+        self.preview_started_at = None
+        self.preview_duration = 0.0
+        self.preview_time_var.set("Preview: stopped")
 
     def _on_close(self) -> None:
+        self._closing = True
+        self._cancel_after("_poll_after_id")
+        self._cancel_after("_refresh_after_id")
         self.stop_preview()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _export_worker(self, rows: list[tuple]) -> None:
         ok = failed = 0
@@ -907,7 +1009,7 @@ class AudioCatalogApp:
         for index, row in enumerate(rows, 1):
             _, language, name, asset, _speaker, _duration, size, file_id, source_path, offset, _relative = row
             file_id = int(file_id)
-            destination = row_mp3_path(output, language, asset, file_id)
+            destination = row_mp3_path(output, language, asset, file_id, self.language_prefix_var.get())
             try:
                 export_mp3(Path(source_path), offset, size, file_id, destination, self.vgm_var.get(), self.ffmpeg_var.get())
                 ok += 1
@@ -920,6 +1022,9 @@ class AudioCatalogApp:
         self.events.put(("done", f"Finished MP3 export/repair: {ok} succeeded, {failed} failed."))
 
     def _poll_events(self) -> None:
+        self._poll_after_id = None
+        if self._closing:
+            return
         try:
             while True:
                 kind, message = self.events.get_nowait()
@@ -932,18 +1037,45 @@ class AudioCatalogApp:
                     else:
                         shutil.rmtree(directory, ignore_errors=True)
                 elif kind == "preview_ready":
-                    token_text, wav_path = message.split("\t", 1)
+                    token_text, wav_path, duration_text = message.split("\t", 2)
                     if int(token_text) == self.preview_token:
                         try:
                             import winsound
                             winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                            self.preview_duration = float(duration_text)
+                            self.preview_started_at = time.monotonic()
+                            self._update_preview_countdown()
                         except (ImportError, RuntimeError) as exc:
                             self._log(f"Preview playback unavailable: {exc}")
                 elif kind == "done":
                     self._log(message); self.running = False; self.refresh_catalog()
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_events)
+        if not self._closing:
+            self._update_preview_countdown()
+            try:
+                self._poll_after_id = self.root.after(100, self._poll_events)
+            except tk.TclError:
+                self._poll_after_id = None
+
+    def _update_preview_countdown(self) -> None:
+        if self.preview_started_at is None:
+            return
+        remaining = max(0.0, self.preview_duration - (time.monotonic() - self.preview_started_at))
+        seconds = int(remaining + 0.999)
+        self.preview_time_var.set(f"Preview remaining: {seconds // 60:02d}:{seconds % 60:02d}")
+        if remaining <= 0:
+            try:
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except (ImportError, RuntimeError):
+                pass
+            if self.preview_dir:
+                shutil.rmtree(self.preview_dir, ignore_errors=True)
+                self.preview_dir = None
+            self.preview_started_at = None
+            self.preview_duration = 0.0
+            self.preview_time_var.set("Preview: finished")
 
 
 def main() -> None:
